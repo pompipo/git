@@ -1513,6 +1513,12 @@ test_lazy_prereq SYMLINKS '
 	ln -s x y && test -h y
 '
 
+test_lazy_prereq SYMLINKS_WINDOWS '
+	# test whether symbolic links are enabled on Windows
+	test_have_prereq MINGW &&
+	cmd //c "mklink y x" &> /dev/null && test -h y
+'
+
 test_lazy_prereq FILEMODE '
 	test "$(git config --bool core.filemode)" = true
 '
@@ -1674,3 +1680,9 @@ test_lazy_prereq REBASE_P '
 # Tests that verify the scheduler integration must set this locally
 # to avoid errors.
 GIT_TEST_MAINT_SCHEDULER="none:exit 1"
+
+# Does this platform support `git fsmonitor--daemon`
+#
+test_lazy_prereq FSMONITOR_DAEMON '
+	git version --build-options | grep "feature:" | grep "fsmonitor--daemon"
+'
