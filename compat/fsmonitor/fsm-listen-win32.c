@@ -1,7 +1,7 @@
 #include "cache.h"
 #include "config.h"
 #include "fsmonitor.h"
-#include "fsmonitor-fs-listen.h"
+#include "fsm-listen.h"
 #include "fsmonitor--daemon.h"
 
 /*
@@ -100,7 +100,7 @@ normalize:
 	return strbuf_normalize_path(normalized_path);
 }
 
-void fsmonitor_fs_listen__stop_async(struct fsmonitor_daemon_state *state)
+void fsm_listen__stop_async(struct fsmonitor_daemon_state *state)
 {
 	SetEvent(state->backend_data->hListener[LISTENER_SHUTDOWN]);
 }
@@ -113,8 +113,14 @@ static struct one_watch *create_watch(struct fsmonitor_daemon_state *state,
 	DWORD share_mode =
 		FILE_SHARE_WRITE | FILE_SHARE_READ | FILE_SHARE_DELETE;
 	HANDLE hDir;
+	wchar_t wpath[MAX_PATH];
 
-	hDir = CreateFileA(path,
+	if (xutftowcs_path(wpath, path) < 0) {
+		error(_("could not convert to wide characters: '%s'"), path);
+		return NULL;
+	}
+
+	hDir = CreateFileW(wpath,
 			   desired_access, share_mode, NULL, OPEN_EXISTING,
 			   FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
 			   NULL);
@@ -167,7 +173,6 @@ static int start_rdcw_watch(struct fsmonitor_daemon_backend_data *data,
 	memset(&watch->overlapped, 0, sizeof(watch->overlapped));
 	watch->overlapped.hEvent = watch->hEvent;
 
-start_watch:
 	/*
 	 * Queue an async call using Overlapped IO.  This returns immediately.
 	 * Our event handle will be signalled when the real result is available.
@@ -179,20 +184,6 @@ start_watch:
 		watch->hDir, watch->buffer, watch->buf_len, TRUE,
 		dwNotifyFilter, &watch->count, &watch->overlapped, NULL);
 
-	/*
-	 * The kernel throws an invalid parameter error when our buffer
-	 * is too big and we are pointed at a remote directory (and possibly
-	 * for other reasons).  Quietly set it down and try again.
-	 *
-	 * See note about MAX_RDCW_BUF at the top.
-	 */
-	if (!watch->is_active &&
-	    GetLastError() == ERROR_INVALID_PARAMETER &&
-	    watch->buf_len > MAX_RDCW_BUF_FALLBACK) {
-		watch->buf_len = MAX_RDCW_BUF_FALLBACK;
-		goto start_watch;
-	}
-
 	if (watch->is_active)
 		return 0;
 
@@ -203,6 +194,8 @@ start_watch:
 
 static int recv_rdcw_watch(struct one_watch *watch)
 {
+	DWORD gle;
+
 	watch->is_active = FALSE;
 
 	/*
@@ -212,6 +205,21 @@ static int recv_rdcw_watch(struct one_watch *watch)
 	if (GetOverlappedResult(watch->hDir, &watch->overlapped, &watch->count,
 				TRUE))
 		return 0;
+
+	gle = GetLastError();
+	if (gle == ERROR_INVALID_PARAMETER &&
+	    /*
+	     * The kernel throws an invalid parameter error when our
+	     * buffer is too big and we are pointed at a remote
+	     * directory (and possibly for other reasons).  Quietly
+	     * set it down and try again.
+	     *
+	     * See note about MAX_RDCW_BUF at the top.
+	     */
+	    watch->buf_len > MAX_RDCW_BUF_FALLBACK) {
+		watch->buf_len = MAX_RDCW_BUF_FALLBACK;
+		return -2;
+	}
 
 	/*
 	 * NEEDSWORK: If an external <gitdir> is deleted, the above
@@ -223,7 +231,7 @@ static int recv_rdcw_watch(struct one_watch *watch)
 	 */
 
 	error("GetOverlappedResult failed on '%s' [GLE %ld]",
-	      watch->path.buf, GetLastError());
+	      watch->path.buf, gle);
 	return -1;
 }
 
@@ -492,10 +500,11 @@ skip_this_path:
 	return LISTENER_HAVE_DATA_GITDIR;
 }
 
-void fsmonitor_fs_listen__loop(struct fsmonitor_daemon_state *state)
+void fsm_listen__loop(struct fsmonitor_daemon_state *state)
 {
 	struct fsmonitor_daemon_backend_data *data = state->backend_data;
 	DWORD dwWait;
+	int result;
 
 	state->error_code = 0;
 
@@ -512,8 +521,19 @@ void fsmonitor_fs_listen__loop(struct fsmonitor_daemon_state *state)
 						FALSE, INFINITE);
 
 		if (dwWait == WAIT_OBJECT_0 + LISTENER_HAVE_DATA_WORKTREE) {
-			if (recv_rdcw_watch(data->watch_worktree) == -1)
+			result = recv_rdcw_watch(data->watch_worktree);
+			if (result == -1) {
+				/* hard error */
 				goto force_error_stop;
+			}
+			if (result == -2) {
+				/* retryable error */
+				if (start_rdcw_watch(data, data->watch_worktree) == -1)
+					goto force_error_stop;
+				continue;
+			}
+
+			/* have data */
 			if (process_worktree_events(state) == LISTENER_SHUTDOWN)
 				goto force_shutdown;
 			if (start_rdcw_watch(data, data->watch_worktree) == -1)
@@ -522,8 +542,19 @@ void fsmonitor_fs_listen__loop(struct fsmonitor_daemon_state *state)
 		}
 
 		if (dwWait == WAIT_OBJECT_0 + LISTENER_HAVE_DATA_GITDIR) {
-			if (recv_rdcw_watch(data->watch_gitdir) == -1)
+			result = recv_rdcw_watch(data->watch_gitdir);
+			if (result == -1) {
+				/* hard error */
 				goto force_error_stop;
+			}
+			if (result == -2) {
+				/* retryable error */
+				if (start_rdcw_watch(data, data->watch_gitdir) == -1)
+					goto force_error_stop;
+				continue;
+			}
+
+			/* have data */
 			if (process_gitdir_events(state) == LISTENER_SHUTDOWN)
 				goto force_shutdown;
 			if (start_rdcw_watch(data, data->watch_gitdir) == -1)
@@ -555,7 +586,7 @@ clean_shutdown:
 	cancel_rdcw_watch(data->watch_gitdir);
 }
 
-int fsmonitor_fs_listen__ctor(struct fsmonitor_daemon_state *state)
+int fsm_listen__ctor(struct fsmonitor_daemon_state *state)
 {
 	struct fsmonitor_daemon_backend_data *data;
 	char shortname[16]; /* a padded 8.3 buffer */
@@ -646,7 +677,7 @@ failed:
 	return -1;
 }
 
-void fsmonitor_fs_listen__dtor(struct fsmonitor_daemon_state *state)
+void fsm_listen__dtor(struct fsmonitor_daemon_state *state)
 {
 	struct fsmonitor_daemon_backend_data *data;
 

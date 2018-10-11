@@ -3,7 +3,7 @@
 #include "parse-options.h"
 #include "fsmonitor.h"
 #include "fsmonitor-ipc.h"
-#include "compat/fsmonitor/fsmonitor-fs-listen.h"
+#include "compat/fsmonitor/fsm-listen.h"
 #include "fsmonitor--daemon.h"
 #include "simple-ipc.h"
 #include "khash.h"
@@ -466,21 +466,23 @@ static void fsmonitor_batch__combine(struct fsmonitor_batch *batch_dest,
  * and truncate the list there.  Note that these timestamps are completely
  * artificial (based on when we pinned the batch item) and not on any
  * filesystem activity.
+ *
+ * Return the obsolete portion of the list after we have removed it from
+ * the official list so that the caller can free it after leaving the lock.
  */
 #define MY_TIME_DELAY_SECONDS (5 * 60) /* seconds */
 
-static void with_lock__truncate_old_batches(
+static struct fsmonitor_batch *with_lock__truncate_old_batches(
 	struct fsmonitor_daemon_state *state,
 	const struct fsmonitor_batch *batch_marker)
 {
 	/* assert current thread holding state->main_lock */
 
 	const struct fsmonitor_batch *batch;
-	struct fsmonitor_batch *rest;
-	struct fsmonitor_batch *p;
+	struct fsmonitor_batch *remainder;
 
 	if (!batch_marker)
-		return;
+		return NULL;
 
 	trace_printf_key(&trace_fsmonitor, "Truncate: mark (%"PRIu64",%"PRIu64")",
 			 batch_marker->batch_seq_nr,
@@ -499,15 +501,25 @@ static void with_lock__truncate_old_batches(
 		goto truncate_past_here;
 	}
 
-	return;
+	return NULL;
 
 truncate_past_here:
 	state->current_token_data->batch_tail = (struct fsmonitor_batch *)batch;
 
-	rest = ((struct fsmonitor_batch *)batch)->next;
+	remainder = ((struct fsmonitor_batch *)batch)->next;
 	((struct fsmonitor_batch *)batch)->next = NULL;
 
-	for (p = rest; p; p = fsmonitor_batch__pop(p)) {
+	return remainder;
+}
+
+static void free_remainder(struct fsmonitor_batch *remainder)
+{
+	struct fsmonitor_batch *p;
+
+	if (!remainder)
+		return;
+
+	for (p = remainder; p; p = fsmonitor_batch__pop(p)) {
 		trace_printf_key(&trace_fsmonitor,
 				 "Truncate: kill (%"PRIu64",%"PRIu64")",
 				 p->batch_seq_nr, (uint64_t)p->pinned_time);
@@ -635,6 +647,7 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 	const char *p;
 	const struct fsmonitor_batch *batch_head;
 	const struct fsmonitor_batch *batch;
+	struct fsmonitor_batch *remainder = NULL;
 	intmax_t count = 0, duplicates = 0;
 	kh_str_t *shown;
 	int hash_ret;
@@ -899,11 +912,13 @@ static int do_handle_client(struct fsmonitor_daemon_state *state,
 			 * obsolete.  See if we can truncate the list
 			 * and save some memory.
 			 */
-			with_lock__truncate_old_batches(state, batch);
+			remainder = with_lock__truncate_old_batches(state, batch);
 		}
 	}
 
 	pthread_mutex_unlock(&state->main_lock);
+
+	free_remainder(remainder);
 
 	trace2_data_intmax("fsmonitor", the_repository, "response/length", total_response_len);
 	trace2_data_intmax("fsmonitor", the_repository, "response/count/files", count);
@@ -1107,7 +1122,7 @@ void fsmonitor_publish(struct fsmonitor_daemon_state *state,
 	pthread_mutex_unlock(&state->main_lock);
 }
 
-static void *fsmonitor_fs_listen__thread_proc(void *_state)
+static void *fsm_listen__thread_proc(void *_state)
 {
 	struct fsmonitor_daemon_state *state = _state;
 
@@ -1119,7 +1134,7 @@ static void *fsmonitor_fs_listen__thread_proc(void *_state)
 		trace_printf_key(&trace_fsmonitor, "Watching: gitdir '%s'",
 				 state->path_gitdir_watch.buf);
 
-	fsmonitor_fs_listen__loop(state);
+	fsm_listen__loop(state);
 
 	pthread_mutex_lock(&state->main_lock);
 	if (state->current_token_data &&
@@ -1161,7 +1176,7 @@ static int fsmonitor_run_daemon_1(struct fsmonitor_daemon_state *state)
 	 * events.
 	 */
 	if (pthread_create(&state->listener_thread, NULL,
-			   fsmonitor_fs_listen__thread_proc, state) < 0) {
+			   fsm_listen__thread_proc, state) < 0) {
 		ipc_server_stop_async(state->ipc_server_data);
 		ipc_server_await(state->ipc_server_data);
 
@@ -1180,7 +1195,7 @@ static int fsmonitor_run_daemon_1(struct fsmonitor_daemon_state *state)
 	 * event from the IPC thread pool, but it doesn't hurt to tell
 	 * it again.  And wait for it to shutdown.
 	 */
-	fsmonitor_fs_listen__stop_async(state);
+	fsm_listen__stop_async(state);
 	pthread_join(state->listener_thread, NULL);
 
 	return state->error_code;
@@ -1262,7 +1277,7 @@ static int fsmonitor_run_daemon(void)
 	 * Confirm that we can create platform-specific resources for the
 	 * filesystem listener before we bother starting all the threads.
 	 */
-	if (fsmonitor_fs_listen__ctor(&state)) {
+	if (fsm_listen__ctor(&state)) {
 		err = error(_("could not initialize listener thread"));
 		goto done;
 	}
@@ -1272,7 +1287,7 @@ static int fsmonitor_run_daemon(void)
 done:
 	pthread_cond_destroy(&state.cookies_cond);
 	pthread_mutex_destroy(&state.main_lock);
-	fsmonitor_fs_listen__dtor(&state);
+	fsm_listen__dtor(&state);
 
 	ipc_server_free(state.ipc_server_data);
 
@@ -1287,7 +1302,7 @@ done:
 	return err;
 }
 
-static int try_to_run_foreground_daemon(void)
+static int try_to_run_foreground_daemon(int free_console)
 {
 	/*
 	 * Technically, we don't need to probe for an existing daemon
@@ -1304,6 +1319,11 @@ static int try_to_run_foreground_daemon(void)
 	printf(_("running fsmonitor-daemon in '%s'\n"),
 	       the_repository->worktree);
 	fflush(stdout);
+
+#ifdef GIT_WINDOWS_NATIVE
+	if (free_console)
+		FreeConsole();
+#endif
 
 	return !!fsmonitor_run_daemon();
 }
@@ -1322,7 +1342,7 @@ static int try_to_run_foreground_daemon(void)
  * The current process returns so that the caller can wait for the child
  * to startup before exiting.
  */
-static int spawn_background_fsmonitor_daemon(pid_t *pid)
+static int spawn_fsmonitor(pid_t *pid)
 {
 	char git_exe[MAX_PATH];
 	struct strvec args = STRVEC_INIT;
@@ -1336,6 +1356,7 @@ static int spawn_background_fsmonitor_daemon(pid_t *pid)
 	strvec_push(&args, git_exe);
 	strvec_push(&args, "fsmonitor--daemon");
 	strvec_push(&args, "run");
+	strvec_push(&args, "--free-console");
 	strvec_pushf(&args, "--ipc-threads=%d", fsmonitor__ipc_threads);
 
 	*pid = mingw_spawnvpe(args.v[0], args.v, NULL, NULL, in, out, out);
@@ -1363,7 +1384,7 @@ static int spawn_background_fsmonitor_daemon(pid_t *pid)
  * The fork-parent returns the child PID so that we can wait for the
  * child to startup before exiting.
  */
-static int spawn_background_fsmonitor_daemon(pid_t *pid)
+static int spawn_fsmonitor(pid_t *pid)
 {
 	*pid = fork();
 
@@ -1392,7 +1413,7 @@ static int spawn_background_fsmonitor_daemon(pid_t *pid)
  * let it get started and begin listening for requests on the socket
  * before reporting our success.
  */
-static int wait_for_background_startup(pid_t pid_child)
+static int wait_for_startup(pid_t pid_child)
 {
 	int status;
 	pid_t pid_seen;
@@ -1481,7 +1502,7 @@ static int try_to_start_background_daemon(void)
 	/*
 	 * Run the actual daemon in a background process.
 	 */
-	ret = spawn_background_fsmonitor_daemon(&pid_child);
+	ret = spawn_fsmonitor(&pid_child);
 	if (pid_child <= 0)
 		return ret;
 
@@ -1491,7 +1512,7 @@ static int try_to_start_background_daemon(void)
 	 * the "start" command more synchronous and more reliable in
 	 * tests.
 	 */
-	ret = wait_for_background_startup(pid_child);
+	ret = wait_for_startup(pid_child);
 
 	return ret;
 }
@@ -1499,8 +1520,10 @@ static int try_to_start_background_daemon(void)
 int cmd_fsmonitor__daemon(int argc, const char **argv, const char *prefix)
 {
 	const char *subcmd;
+	int free_console = 0;
 
 	struct option options[] = {
+		OPT_BOOL(0, "free-console", &free_console, N_("free console")),
 		OPT_INTEGER(0, "ipc-threads",
 			    &fsmonitor__ipc_threads,
 			    N_("use <n> ipc worker threads")),
@@ -1530,18 +1553,21 @@ int cmd_fsmonitor__daemon(int argc, const char **argv, const char *prefix)
 		    fsmonitor__ipc_threads);
 
 	prepare_repo_settings(the_repository);
-	if (!the_repository->worktree)
-		return error(_("fsmonitor-daemon does not support bare repos '%s'"),
-			     xgetcwd());
-	if (the_repository->settings.fsmonitor_mode == FSMONITOR_MODE_INCOMPATIBLE)
-		return error(_("fsmonitor-daemon is incompatible with this repo '%s'"),
-			     the_repository->worktree);
+
+	fsm_settings__set_ipc(the_repository);
+	if (fsm_settings__get_mode(the_repository) == FSMONITOR_MODE_INCOMPATIBLE) {
+		struct strbuf buf_reason = STRBUF_INIT;
+		fsm_settings__get_reason(the_repository, &buf_reason);
+		error("%s '%s'", buf_reason.buf, xgetcwd());
+		strbuf_release(&buf_reason);
+		return -1;
+	}
 
 	if (!strcmp(subcmd, "start"))
 		return !!try_to_start_background_daemon();
 
 	if (!strcmp(subcmd, "run"))
-		return !!try_to_run_foreground_daemon();
+		return !!try_to_run_foreground_daemon(free_console);
 
 	if (!strcmp(subcmd, "stop"))
 		return !!do_as_client__send_stop();

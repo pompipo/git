@@ -157,13 +157,10 @@ static int query_fsmonitor_hook(struct repository *r,
 	struct child_process cp = CHILD_PROCESS_INIT;
 	int result;
 
-	if (r->settings.fsmonitor_mode != FSMONITOR_MODE_HOOK)
+	if (fsm_settings__get_mode(r) != FSMONITOR_MODE_HOOK)
 		return -1;
 
-	assert(r->settings.fsmonitor_hook_path);
-	assert(*r->settings.fsmonitor_hook_path);
-
-	strvec_push(&cp.args, r->settings.fsmonitor_hook_path);
+	strvec_push(&cp.args, fsm_settings__get_hook_path(r));
 	strvec_pushf(&cp.args, "%d", version);
 	strvec_pushf(&cp.args, "%s", last_update);
 	cp.use_shell = 1;
@@ -285,8 +282,9 @@ void refresh_fsmonitor(struct index_state *istate)
 	char *buf;
 	unsigned int i;
 	struct repository *r = istate->repo ? istate->repo : the_repository;
+	enum fsmonitor_mode fsm_mode = fsm_settings__get_mode(r);
 
-	if (r->settings.fsmonitor_mode <= FSMONITOR_MODE_DISABLED ||
+	if (fsm_mode <= FSMONITOR_MODE_DISABLED ||
 	    istate->fsmonitor_has_run_once)
 		return;
 
@@ -294,7 +292,7 @@ void refresh_fsmonitor(struct index_state *istate)
 
 	trace_printf_key(&trace_fsmonitor, "refresh fsmonitor");
 
-	if (r->settings.fsmonitor_mode == FSMONITOR_MODE_IPC) {
+	if (fsm_mode == FSMONITOR_MODE_IPC) {
 		query_success = !fsmonitor_ipc__send_query(
 			istate->fsmonitor_last_update ?
 			istate->fsmonitor_last_update : "builtin:fake",
@@ -325,17 +323,10 @@ void refresh_fsmonitor(struct index_state *istate)
 			strbuf_addstr(&last_update_token, "builtin:fake");
 		}
 
-		/*
-		 * Regardless of whether we successfully talked to a
-		 * fsmonitor daemon or not, we skip over and do not
-		 * try to use the hook.  The "core.useBuiltinFSMonitor"
-		 * config setting ALWAYS overrides the "core.fsmonitor"
-		 * hook setting.
-		 */
 		goto apply_results;
 	}
 
-	assert(r->settings.fsmonitor_mode == FSMONITOR_MODE_HOOK);
+	assert(fsm_mode == FSMONITOR_MODE_HOOK);
 
 	hook_version = fsmonitor_hook_version();
 
@@ -391,10 +382,10 @@ void refresh_fsmonitor(struct index_state *istate)
 		}
 
 		trace_performance_since(last_update, "fsmonitor process '%s'",
-					r->settings.fsmonitor_hook_path);
+					fsm_settings__get_hook_path(r));
 		trace_printf_key(&trace_fsmonitor,
 				 "fsmonitor process '%s' returned %s",
-				 r->settings.fsmonitor_hook_path,
+				 fsm_settings__get_hook_path(r),
 				 query_success ? "success" : "failure");
 	}
 
@@ -542,7 +533,7 @@ void tweak_fsmonitor(struct index_state *istate)
 {
 	unsigned int i;
 	struct repository *r = istate->repo ? istate->repo : the_repository;
-	int fsmonitor_enabled = r->settings.fsmonitor_mode > FSMONITOR_MODE_DISABLED;
+	int fsmonitor_enabled = (fsm_settings__get_mode(r) > FSMONITOR_MODE_DISABLED);
 
 	if (istate->fsmonitor_dirty) {
 		if (fsmonitor_enabled) {

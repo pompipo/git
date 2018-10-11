@@ -1216,11 +1216,17 @@ int cmd_update_index(int argc, const char **argv, const char *prefix)
 	}
 
 	if (fsmonitor > 0) {
-		if (r->settings.fsmonitor_mode == FSMONITOR_MODE_INCOMPATIBLE)
-			return error(
-				_("repository is incompatible with fsmonitor"));
+		enum fsmonitor_mode fsm_mode = fsm_settings__get_mode(r);
 
-		if (r->settings.fsmonitor_mode == FSMONITOR_MODE_DISABLED) {
+		if (fsm_mode == FSMONITOR_MODE_INCOMPATIBLE) {
+			struct strbuf buf_reason = STRBUF_INIT;
+			fsm_settings__get_reason(r, &buf_reason);
+			error("%s", buf_reason.buf);
+			strbuf_release(&buf_reason);
+			return -1;
+		}
+
+		if (fsm_mode == FSMONITOR_MODE_DISABLED) {
 			warning(_("core.useBuiltinFSMonitor is unset; "
 				"set it if you really want to enable the "
 				"builtin fsmonitor"));
@@ -1231,11 +1237,12 @@ int cmd_update_index(int argc, const char **argv, const char *prefix)
 		add_fsmonitor(&the_index);
 		report(_("fsmonitor enabled"));
 	} else if (!fsmonitor) {
-		if (r->settings.fsmonitor_mode == FSMONITOR_MODE_IPC)
+		enum fsmonitor_mode fsm_mode = fsm_settings__get_mode(r);
+		if (fsm_mode == FSMONITOR_MODE_IPC)
 			warning(_("core.useBuiltinFSMonitor is set; "
 				"remove it if you really want to "
 				"disable fsmonitor"));
-		if (r->settings.fsmonitor_mode == FSMONITOR_MODE_HOOK)
+		if (fsm_mode == FSMONITOR_MODE_HOOK)
 			warning(_("core.fsmonitor is set; "
 				"remove it if you really want to "
 				"disable fsmonitor"));

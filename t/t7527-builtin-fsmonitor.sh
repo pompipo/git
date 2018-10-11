@@ -29,6 +29,16 @@ start_daemon () {
 	return 0
 }
 
+# Is a Trace2 data event present with the given catetory and key?
+# We do not care what the value is.
+#
+have_t2_data_event () {
+	c=$1
+	k=$2
+
+	grep -e '"event":"data".*"category":"'"$c"'".*"key":"'"$k"'"'
+}
+
 test_expect_success 'explicit daemon start and stop' '
 	test_when_finished "stop_daemon_delete_repo test_explicit" &&
 
@@ -64,7 +74,7 @@ test_expect_success 'implicit daemon start' '
 	# dependent, just confirm that the foreground command received a
 	# response from the daemon.
 
-	grep :\"query/response-length\" .git/trace &&
+	have_t2_data_event fsm_client query/response-length <.git/trace &&
 
 	git -C test_implicit fsmonitor--daemon status &&
 	git -C test_implicit fsmonitor--daemon stop &&
@@ -160,8 +170,8 @@ test_expect_success MINGW,SHORTNAMES 'implicit daemon stop (rename GIT~2)' '
 	echo HELLO >test_implicit_1s2/GIT~1 &&
 	git init test_implicit_1s2 &&
 
-	[ -f test_implicit_1s2/GIT~1 ] &&
-	[ -d test_implicit_1s2/GIT~2 ] &&
+	test_path_is_file test_implicit_1s2/GIT~1 &&
+	test_path_is_dir  test_implicit_1s2/GIT~2 &&
 
 	start_daemon test_implicit_1s2 &&
 
@@ -198,8 +208,8 @@ test_expect_success UTF8_NFD_TO_NFC 'MacOS event spelling (rename .GIT)' '
 	git init test_apfs &&
 	start_daemon test_apfs &&
 
-	[ -d test_apfs/.git ] &&
-	[ -d test_apfs/.GIT ] &&
+	test_path_is_dir test_apfs/.git &&
+	test_path_is_dir test_apfs/.GIT &&
 
 	mv test_apfs/.GIT test_apfs/.FOO &&
 	sleep 1 &&
@@ -277,7 +287,9 @@ test_expect_success 'update-index implicitly starts daemon' '
 	git fsmonitor--daemon status &&
 	test_might_fail git fsmonitor--daemon stop &&
 
-	grep \"event\":\"start\".*\"fsmonitor--daemon\" .git/trace_implicit_1
+	# Confirm that the trace2 log contains a record of the
+	# daemon starting.
+	test_subcommand git fsmonitor--daemon start <.git/trace_implicit_1
 '
 
 test_expect_success 'status implicitly starts daemon' '
@@ -291,7 +303,9 @@ test_expect_success 'status implicitly starts daemon' '
 	git fsmonitor--daemon status &&
 	test_might_fail git fsmonitor--daemon stop &&
 
-	grep \"event\":\"start\".*\"fsmonitor--daemon\" .git/trace_implicit_2
+	# Confirm that the trace2 log contains a record of the
+	# daemon starting.
+	test_subcommand git fsmonitor--daemon start <.git/trace_implicit_2
 '
 
 edit_files() {
@@ -674,6 +688,29 @@ do
 		matrix_try $uc_val $fsm_val file_to_directory
 		matrix_try $uc_val $fsm_val directory_to_file
 	done
+done
+
+# Test Unicode UTF-8 characters in the pathname of the working
+# directory.  Use of "*A()" routines rather than "*W()" routines
+# on Windows can sometimes lead to odd failures.
+#
+u1=$(printf "u_c3_a6__\xC3\xA6")
+u2=$(printf "u_e2_99_ab__\xE2\x99\xAB")
+u_values="$u1 $u2"
+for u in $u_values
+do
+	test_expect_success "Unicode path: $u" '
+		test_when_finished "stop_daemon_delete_repo $u" &&
+
+		git init "$u" &&
+		echo 1 >"$u"/file1 &&
+		git -C "$u" add file1 &&
+		git -C "$u" config core.useBuiltinFSMonitor true &&
+
+		start_daemon "$u" &&
+		git -C "$u" status >actual &&
+		grep "new file:   file1" actual
+	'
 done
 
 test_done
