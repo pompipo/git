@@ -57,10 +57,7 @@ int fsmonitor_is_trivial_response(const struct strbuf *query_result);
  */
 static inline int is_fsmonitor_refreshed(const struct index_state *istate)
 {
-	struct repository *r = istate->repo ? istate->repo : the_repository;
-
-	return r->settings.fsmonitor_mode <= FSMONITOR_MODE_DISABLED ||
-		istate->fsmonitor_has_run_once;
+	return !core_fsmonitor || istate->fsmonitor_has_run_once;
 }
 
 /*
@@ -70,10 +67,7 @@ static inline int is_fsmonitor_refreshed(const struct index_state *istate)
  */
 static inline void mark_fsmonitor_valid(struct index_state *istate, struct cache_entry *ce)
 {
-	struct repository *r = istate->repo ? istate->repo : the_repository;
-
-	if (r->settings.fsmonitor_mode > FSMONITOR_MODE_DISABLED &&
-	    !(ce->ce_flags & CE_FSMONITOR_VALID)) {
+	if (core_fsmonitor && !(ce->ce_flags & CE_FSMONITOR_VALID)) {
 		istate->cache_changed = 1;
 		ce->ce_flags |= CE_FSMONITOR_VALID;
 		trace_printf_key(&trace_fsmonitor, "mark_fsmonitor_clean '%s'", ce->name);
@@ -89,9 +83,7 @@ static inline void mark_fsmonitor_valid(struct index_state *istate, struct cache
  */
 static inline void mark_fsmonitor_invalid(struct index_state *istate, struct cache_entry *ce)
 {
-	struct repository *r = istate->repo ? istate->repo : the_repository;
-
-	if (r->settings.fsmonitor_mode > FSMONITOR_MODE_DISABLED) {
+	if (core_fsmonitor) {
 		ce->ce_flags &= ~CE_FSMONITOR_VALID;
 		untracked_cache_invalidate_path(istate, ce->name, 1);
 		trace_printf_key(&trace_fsmonitor, "mark_fsmonitor_invalid '%s'", ce->name);
